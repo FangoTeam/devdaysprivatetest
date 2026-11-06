@@ -1,0 +1,17 @@
+@host = http://localhost:5080
+
+### Listar
+GET {{host}}/incidencias
+
+### Crear
+POST {{host}}/incidencias
+Content-Type: application/json
+
+{ "titulo": "Teclado roto en el aula 5", "aula": "Aula 5", "prioridad": "Media" }
+
+### Vencidas (existe tras la issue)
+GET {{host}}/incidencias/vencidas
+
+### Exportar
+GET {{host}}/admin/exportar
+X-Api-Key: clave-solo-para-desarrollo
