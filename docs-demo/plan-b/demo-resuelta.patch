@@ -1,0 +1,172 @@
+diff --git a/README.md b/README.md
+index b6d39e4..1783345 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,7 @@ En Development la hora está simulada (lunes 9/11/2026, 12:30 Madrid) y se carga
+ |---|---|---|
+ | GET | /panel | Panel de incidencias con su estado de SLA |
+ | GET | /incidencias | Lista las incidencias |
++| GET | /incidencias/vencidas | Incidencias no resueltas con el SLA vencido (solo horario lectivo) |
+ | GET | /incidencias/{id} | Detalle |
+ | POST | /incidencias | Crea `{ "titulo", "aula", "prioridad" }` |
+ | POST | /incidencias/{id}/resolver | Marca como resuelta |
+diff --git a/docs-demo/peticiones.http b/docs-demo/peticiones.http
+index bf45396..03bc60b 100644
+--- a/docs-demo/peticiones.http
++++ b/docs-demo/peticiones.http
+@@ -14,4 +14,4 @@ GET {{host}}/incidencias/vencidas
+ 
+ ### Exportar
+ GET {{host}}/admin/exportar
+-X-Api-Key: soporte-2024-admin
++X-Api-Key: clave-solo-para-desarrollo
+diff --git a/src/SoporteIT.Api/Program.cs b/src/SoporteIT.Api/Program.cs
+index e110845..6abf3a0 100644
+--- a/src/SoporteIT.Api/Program.cs
++++ b/src/SoporteIT.Api/Program.cs
+@@ -27,6 +27,8 @@ var incidencias = app.MapGroup("/incidencias");
+ 
+ incidencias.MapGet("/", (ServicioIncidencias servicio) => servicio.Listar());
+ 
++incidencias.MapGet("/vencidas", (ServicioIncidencias servicio) => servicio.Vencidas());
++
+ incidencias.MapGet("/{id:int}", (int id, ServicioIncidencias servicio) =>
+     servicio.Obtener(id) is { } incidencia
+         ? Results.Ok(incidencia)
+@@ -46,9 +48,9 @@ incidencias.MapPost("/{id:int}/resolver", (int id, ServicioIncidencias servicio)
+         ? Results.NoContent()
+         : Results.NotFound(new { error = "Incidencia no encontrada" }));
+ 
+-const string ClaveAdmin = "soporte-2024-admin"; // TODO: mover a configuración
++var claveAdmin = app.Configuration["Admin:ClaveApi"];
+ app.MapGet("/admin/exportar", (HttpRequest peticion, ServicioIncidencias servicio) =>
+-    peticion.Headers["X-Api-Key"] == ClaveAdmin
++    !string.IsNullOrEmpty(claveAdmin) && peticion.Headers["X-Api-Key"] == claveAdmin
+         ? Results.Ok(servicio.Listar())
+         : Results.Unauthorized());
+ 
+diff --git a/src/SoporteIT.Api/appsettings.Development.json b/src/SoporteIT.Api/appsettings.Development.json
+index 6e4f824..5eb6883 100644
+--- a/src/SoporteIT.Api/appsettings.Development.json
++++ b/src/SoporteIT.Api/appsettings.Development.json
+@@ -1,3 +1,4 @@
+ {
+-  "Demo": { "AhoraFijo": "2026-11-09T12:30:00+01:00" }
++  "Demo": { "AhoraFijo": "2026-11-09T12:30:00+01:00" },
++  "Admin": { "ClaveApi": "clave-solo-para-desarrollo" }
+ }
+diff --git a/src/SoporteIT.Core/Servicios/HorarioLectivo.cs b/src/SoporteIT.Core/Servicios/HorarioLectivo.cs
+new file mode 100644
+index 0000000..4a8338d
+--- /dev/null
++++ b/src/SoporteIT.Core/Servicios/HorarioLectivo.cs
+@@ -0,0 +1,47 @@
++namespace SoporteIT.Core.Servicios;
++
++/// <summary>Horario lectivo del centro: lunes a viernes, de 08:00 a 15:00 (hora de Madrid).</summary>
++public static class HorarioLectivo
++{
++    private static readonly TimeZoneInfo Madrid = TimeZoneInfo.FindSystemTimeZoneById("Europe/Madrid");
++    private static readonly TimeSpan Apertura = TimeSpan.FromHours(8);
++    private static readonly TimeSpan Cierre = TimeSpan.FromHours(15);
++
++    public static DateTimeOffset SumarHorasLectivas(DateTimeOffset inicio, TimeSpan duracion)
++    {
++        // Se calcula con la hora local de Madrid: el horario lectivo queda lejos del cambio de hora (madrugada del domingo).
++        var actual = AjustarAApertura(TimeZoneInfo.ConvertTime(inicio, Madrid).DateTime);
++        var restante = duracion;
++
++        while (true)
++        {
++            var disponible = actual.Date + Cierre - actual;
++            if (restante <= disponible)
++            {
++                actual += restante;
++                break;
++            }
++
++            restante -= disponible;
++            actual = SiguienteApertura(actual.Date.AddDays(1));
++        }
++
++        return new DateTimeOffset(actual, Madrid.GetUtcOffset(actual));
++    }
++
++    private static DateTime AjustarAApertura(DateTime momento)
++    {
++        if (EsDiaLectivo(momento) && momento.TimeOfDay < Cierre)
++            return momento.TimeOfDay < Apertura ? momento.Date + Apertura : momento;
++
++        return SiguienteApertura(momento.Date.AddDays(1));
++    }
++
++    private static DateTime SiguienteApertura(DateTime dia)
++    {
++        while (!EsDiaLectivo(dia)) dia = dia.AddDays(1);
++        return dia.Date + Apertura;
++    }
++
++    private static bool EsDiaLectivo(DateTime dia) => dia.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday);
++}
+diff --git a/src/SoporteIT.Core/Servicios/PoliticaSla.cs b/src/SoporteIT.Core/Servicios/PoliticaSla.cs
+index 6895b9b..be5855c 100644
+--- a/src/SoporteIT.Core/Servicios/PoliticaSla.cs
++++ b/src/SoporteIT.Core/Servicios/PoliticaSla.cs
+@@ -13,7 +13,7 @@ public static class PoliticaSla
+         _ => TimeSpan.FromHours(24)
+     };
+ 
+-    // TODO: ¿de verdad contamos las noches y los fines de semana?
++    /// <summary>El plazo solo cuenta el horario lectivo (L-V, 08:00-15:00, hora de Madrid).</summary>
+     public static DateTimeOffset Vencimiento(Incidencia incidencia) =>
+-        incidencia.CreadaEn + Objetivo(incidencia.Prioridad);
++        HorarioLectivo.SumarHorasLectivas(incidencia.CreadaEn, Objetivo(incidencia.Prioridad));
+ }
+diff --git a/src/SoporteIT.Core/Servicios/ServicioIncidencias.cs b/src/SoporteIT.Core/Servicios/ServicioIncidencias.cs
+index e0725e7..15e358b 100644
+--- a/src/SoporteIT.Core/Servicios/ServicioIncidencias.cs
++++ b/src/SoporteIT.Core/Servicios/ServicioIncidencias.cs
+@@ -10,6 +10,14 @@ public class ServicioIncidencias(IRepositorioIncidencias repositorio, TimeProvid
+ 
+     public DateTimeOffset Ahora() => reloj.GetUtcNow();
+ 
++    public IReadOnlyList<Incidencia> Vencidas()
++    {
++        var ahora = reloj.GetUtcNow();
++        return repositorio.Listar()
++            .Where(i => i.Estado != EstadoIncidencia.Resuelta && PoliticaSla.Vencimiento(i) < ahora)
++            .ToList();
++    }
++
+     public Incidencia Crear(string titulo, string aula, Prioridad prioridad)
+     {
+         var incidencia = new Incidencia
+diff --git a/docs-demo/pruebas-aceptacion/SlaAceptacionTests.cs b/tests/SoporteIT.Tests/SlaAceptacionTests.cs
+similarity index 100%
+rename from docs-demo/pruebas-aceptacion/SlaAceptacionTests.cs
+rename to tests/SoporteIT.Tests/SlaAceptacionTests.cs
+diff --git a/tests/SoporteIT.Tests/VencidasTests.cs b/tests/SoporteIT.Tests/VencidasTests.cs
+new file mode 100644
+index 0000000..1cdaa26
+--- /dev/null
++++ b/tests/SoporteIT.Tests/VencidasTests.cs
+@@ -0,0 +1,19 @@
++using SoporteIT.Core.Servicios;
++
++namespace SoporteIT.Tests;
++
++public class VencidasTests
++{
++    [Fact]
++    public void Vencidas_solo_devuelve_las_que_han_superado_el_sla_en_horario_lectivo()
++    {
++        var repositorio = new RepositorioEnMemoria();
++        DatosDemo.Cargar(repositorio);
++        var lunesAlMediodia = new DateTimeOffset(2026, 11, 9, 12, 30, 0, TimeSpan.FromHours(1));
++        var servicio = new ServicioIncidencias(repositorio, new RelojFalso(lunesAlMediodia));
++
++        var ids = servicio.Vencidas().Select(i => i.Id).OrderBy(id => id).ToArray();
++
++        Assert.Equal([1, 4, 8], ids);
++    }
++}
